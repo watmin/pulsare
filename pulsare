@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""pulsare — knock on the counterpart's named tmux tab.
+
+Latin: to knock. No turn counter. Two inboxes, last write wins:
+
+    .pulsare/to-claude
+    .pulsare/to-grok
+
+    PULSARE_ROLE=claude|grok
+    PULSARE_SESSION=<tmux session>   # windows must be named claude and grok
+
+    ./pulsare install --session holon --cwd ~/work/holon
+    ./pulsare mcp
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROLES = ("claude", "grok")
+KINDS = ("drawn", "briefed", "scored", "struck", "refute", "ask-admin", "halt")
+REQUIRED_WINDOWS = ("claude", "grok")
+PROTOCOL = "2024-11-05"
+BUSY = (
+    "esc to interrupt",
+    "esc to stop",
+    "ctrl+c to stop",
+    "esc:cancel",
+    "thinking…",
+    "thinking...",
+    "[stop]",
+    "photosynthesizing",
+)
+SKILL = """---
+name: pulsare
+description: >
+  Knock on the counterpart's named tmux tab. Use when PULSARE INGEST appears,
+  or when BRIEF/DESIGN/EXPECTATIONS/SCORE is on disk. Not Task, not spawn_subagent.
+---
+
+# Pulsare
+
+Latin: to knock. Write the files, then knock. There is no floor and no sequence.
+
+- `pulsare_yield` kind=briefed files=[…] — write `.pulsare/to-grok` and send-keys into `grok`
+- `pulsare_yield` kind=scored files=[…] — write `.pulsare/to-claude` and send-keys into `claude`
+- `pulsare_knock` — send-keys the current inbox again. Always legal. Use when the peer missed it.
+- `pulsare_ask_admin` — note for the builder, no knock
+- `pulsare_halt` — tell the peer you are done (still a knock; they read the file)
+
+The ingest line is a pointer: `PULSARE INGEST kind=… file=.pulsare/to-<peer>`.
+Read that file, then the listed arc files. Do not paste the brief.
+"""
+
+
+class Error(Exception):
+    pass
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def other(role: str) -> str:
+    if role == "claude":
+        return "grok"
+    if role == "grok":
+        return "claude"
+    raise Error(f"role must be claude or grok, got {role!r}")
+
+
+def role_of() -> str:
+    role = (os.environ.get("PULSARE_ROLE") or os.environ.get("PAIR_ROLE") or "").strip()
+    if role not in ROLES:
+        raise Error("PULSARE_ROLE (or PAIR_ROLE) must be claude or grok")
+    return role
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        Path(tmp).replace(path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise Error(f"{path} is not a JSON object")
+    return data
+
+
+def write_json(path: Path, obj: dict[str, Any]) -> None:
+    atomic_write(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+
+
+def find_root(start: Path | None = None) -> Path:
+    env = os.environ.get("PULSARE_ROOT") or os.environ.get("PAIR_ROOT")
+    if env:
+        return Path(env).resolve()
+    cur = (start or Path.cwd()).resolve()
+    for d in (cur, *cur.parents):
+        if (d / ".pulsare").is_dir():
+            return (d / ".pulsare").resolve()
+    raise Error(f"no .pulsare/ above {cur} (run: pulsare init)")
+
+
+def cwd_of(root: Path) -> Path:
+    return root.parent
+
+
+def session(root: Path) -> dict[str, Any]:
+    return read_json(root / "session.json")
+
+
+def last(root: Path) -> dict[str, Any]:
+    p = root / "last.json"
+    if not p.is_file():
+        return {}
+    return read_json(p)
+
+
+def inbox(root: Path, peer: str) -> Path:
+    if peer not in ROLES:
+        raise Error(f"inbox peer must be claude or grok, got {peer!r}")
+    return root / f"to-{peer}"
+
+
+def init(dir: Path, session_name: str) -> Path:
+    dir = dir.resolve()
+    root = dir / ".pulsare"
+    root.mkdir(parents=True, exist_ok=True)
+    write_json(root / "session.json", {"schema": 1, "session": session_name, "cwd": str(dir)})
+    return root
+
+
+def resolve_files(cwd: Path, files: list[str]) -> list[str]:
+    if not files:
+        raise Error("yield needs at least one file path")
+    cwd = cwd.resolve()
+    out: list[str] = []
+    for raw in files:
+        p = Path(raw)
+        abs_path = (cwd / p).resolve() if not p.is_absolute() else p.resolve()
+        if not abs_path.is_file():
+            raise Error(f"payload is not a file: {raw}")
+        try:
+            rel = abs_path.relative_to(cwd)
+        except ValueError as exc:
+            raise Error(f"payload escapes cwd: {raw}") from exc
+        out.append(rel.as_posix())
+    return out
+
+
+def tmux(*args: str, timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
+    if not shutil.which("tmux"):
+        raise Error("tmux binary missing")
+    try:
+        return subprocess.run(
+            ["tmux", *args], check=False, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise Error(f"tmux timed out: {args[:4]}") from exc
+
+
+def session_name(root: Path) -> str:
+    env = (os.environ.get("PULSARE_SESSION") or os.environ.get("PAIR_SESSION") or "").strip()
+    bound = str(session(root).get("session") or "").strip()
+    name = env or bound
+    if not name:
+        raise Error("PULSARE_SESSION unset and session.json has no session")
+    if env and bound and env != bound:
+        raise Error(f"PULSARE_SESSION={env!r} != mailbox session {bound!r}")
+    return name
+
+
+def named_targets(sess: str) -> dict[str, str]:
+    exists = tmux("has-session", "-t", sess)
+    if exists.returncode != 0:
+        raise Error(f"no tmux session named {sess!r}")
+    listed = tmux("list-windows", "-t", sess, "-F", "#{window_name}")
+    if listed.returncode != 0:
+        raise Error(listed.stderr.strip() or f"cannot list windows of {sess}")
+    names = [ln.strip() for ln in listed.stdout.splitlines() if ln.strip()]
+    missing = [w for w in REQUIRED_WINDOWS if w not in names]
+    if missing:
+        raise Error(
+            f"tmux session {sess!r} needs windows named claude and grok; "
+            f"missing {missing}; have {names}"
+        )
+    out: dict[str, str] = {}
+    for w in REQUIRED_WINDOWS:
+        proc = tmux(
+            "display-message",
+            "-p",
+            "-t",
+            f"{sess}:{w}",
+            "#{session_name}:#{window_name}.#{pane_index}",
+        )
+        if proc.returncode != 0:
+            raise Error(proc.stderr.strip() or f"cannot resolve {sess}:{w}")
+        out[w] = proc.stdout.strip()
+    return out
+
+
+def bind(root: Path, sess: str) -> dict[str, str]:
+    targets = named_targets(sess)
+    data = session(root)
+    data["session"] = sess
+    data["tmux"] = {"session": sess, "claude": targets["claude"], "grok": targets["grok"]}
+    write_json(root / "session.json", data)
+    return targets
+
+
+def pane_in_mode(target: str) -> bool:
+    proc = tmux("display-message", "-p", "-t", target, "#{pane_in_mode}")
+    return proc.stdout.strip() == "1"
+
+
+def chrome_in_footer(visible: str) -> str | None:
+    tail = "\n".join(visible.splitlines()[-8:]).lower()
+    for needle in BUSY:
+        if needle in tail:
+            return needle
+    return None
+
+
+def pane_busy(target: str) -> str | None:
+    if pane_in_mode(target):
+        return "copy-mode"
+    vis = tmux("capture-pane", "-p", "-t", target).stdout or ""
+    return chrome_in_footer(vis)
+
+
+def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
+    lines = [
+        f"PULSARE INGEST kind={kind} from={role} file={box}",
+        "read:",
+    ]
+    for f in files:
+        lines.append(f"  {f}")
+    if kind in ("drawn", "briefed"):
+        lines.append("Those files are the stone. Strike. Write SCORE. Then pulsare_yield kind=scored.")
+    elif kind == "scored":
+        lines.append("Those files are the strike. Independent re-run. Then pulsare_yield or pulsare_halt.")
+    elif kind == "halt":
+        lines.append("Peer halted. Done-when is claimed. Read the files.")
+    else:
+        lines.append("Read the files and act in role.")
+    return "\n".join(lines) + "\n"
+
+
+def knock(target: str, line: str) -> None:
+    if pane_in_mode(target):
+        raise Error(f"{target} is in copy-mode; refuse send-keys")
+    busy = pane_busy(target)
+    if busy:
+        raise Error(f"{target} looks in-turn ({busy})")
+    if len(line) > 16000:
+        raise Error("ingest line exceeds tmux send-keys cap")
+    send = tmux("send-keys", "-t", target, "-l", "--", line)
+    if send.returncode != 0:
+        raise Error(send.stderr.strip() or "tmux send-keys failed")
+    vis = (tmux("capture-pane", "-p", "-t", target).stdout or "").lower()
+    if "accept suggestion" in vis:
+        tmux("send-keys", "-t", target, "Tab")
+    enter = tmux("send-keys", "-t", target, "Enter")
+    if enter.returncode != 0:
+        raise Error(enter.stderr.strip() or "tmux Enter failed")
+
+
+def write_inbox(root: Path, role: str, kind: str, files: list[str]) -> tuple[Path, str, list[str]]:
+    peer = other(role)
+    cwd = cwd_of(root)
+    if files:
+        rels = resolve_files(cwd, files)
+    elif kind in ("ask-admin", "halt"):
+        rels = []
+    else:
+        raise Error("yield needs at least one file path")
+    box = inbox(root, peer)
+    text = ingest_text(role, kind, rels, box)
+    atomic_write(box, text)
+    write_json(
+        root / "last.json",
+        {"from": role, "to": peer, "kind": kind, "files": rels, "at": now(), "inbox": str(box)},
+    )
+    return box, text, rels
+
+
+def status() -> dict[str, Any]:
+    role = role_of()
+    root = find_root()
+    name = session_name(root)
+    peer = other(role)
+    out: dict[str, Any] = {
+        "role": role,
+        "peer": peer,
+        "session": name,
+        "last": last(root),
+        "inbox": {},
+    }
+    for r in ROLES:
+        p = inbox(root, r)
+        out["inbox"][f"to-{r}"] = p.read_text(encoding="utf-8") if p.is_file() else ""
+    try:
+        out["tmux"] = {"session": name, **bind(root, name)}
+        out["layout"] = "ok"
+    except Error as exc:
+        out["layout"] = str(exc)
+    return out
+
+
+def pulsare_yield(kind: str, files: list[str] | None = None, *, note: str = "") -> dict[str, Any]:
+    if kind not in KINDS:
+        raise Error(f"unknown kind {kind!r}")
+    role = role_of()
+    root = find_root()
+    name = session_name(root)
+    bind(root, name)
+    peer = other(role)
+    box, text, rels = write_inbox(root, role, kind, list(files or []))
+    knock_note = "none"
+    if kind == "ask-admin":
+        knock_note = "ask-admin (no knock)"
+        tmux("display-message", "-t", name, f"PULSARE ask-admin from={role} {note}".strip())
+    else:
+        target = session(root)["tmux"][peer]
+        line = f"PULSARE INGEST kind={kind} file={box}"
+        try:
+            knock(target, line)
+            knock_note = target
+        except Error as exc:
+            knock_note = f"pending ({exc})"
+    return {
+        "role": role,
+        "peer": peer,
+        "kind": kind,
+        "files": rels,
+        "inbox": str(box),
+        "knock": knock_note,
+        "note": note,
+        "ingest": text,
+    }
+
+
+def pulsare_knock() -> dict[str, Any]:
+    """Always legal. Re-send the current inbox at the peer."""
+    role = role_of()
+    root = find_root()
+    peer = other(role)
+    box = inbox(root, peer)
+    if not box.is_file():
+        raise Error(f"no inbox yet ({box.name}) — pulsare_yield first")
+    name = session_name(root)
+    bind(root, name)
+    rec = last(root)
+    kind = str(rec.get("kind") or "briefed")
+    target = session(root)["tmux"][peer]
+    line = f"PULSARE INGEST kind={kind} file={box}"
+    try:
+        knock(target, line)
+        knocked = target
+    except Error as exc:
+        knocked = f"pending ({exc})"
+    return {
+        "role": role,
+        "peer": peer,
+        "kind": kind,
+        "inbox": str(box),
+        "knock": knocked,
+        "ingest": box.read_text(encoding="utf-8"),
+    }
+
+
+def tools() -> list[dict[str, Any]]:
+    try:
+        role = role_of()
+        peer = other(role)
+    except Error:
+        role, peer = "unset", "counterpart"
+    return [
+        {
+            "name": "pulsare_status",
+            "description": (
+                f"You are {role}. Peer is {peer} in tmux window '{peer}'. "
+                "Shows last inbox contents. Does not send keys."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "pulsare_yield",
+            "description": (
+                f"Write .pulsare/to-{peer} and send-keys into window '{peer}'. "
+                "No floor, no sequence. If you have files, knock."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["drawn", "briefed", "scored", "struck", "refute"],
+                    },
+                    "files": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["kind", "files"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "pulsare_knock",
+            "description": (
+                f"Send-keys the current .pulsare/to-{peer} again. Always legal. "
+                "Use when yield said pending, or the peer never woke."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "pulsare_ask_admin",
+            "description": "Need the builder. Writes the inbox, does not knock the peer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "note": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "pulsare_halt",
+            "description": "Tell the peer you are done. Still a knock; they read the inbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"files": {"type": "array", "items": {"type": "string"}}},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _ok(obj: dict[str, Any]) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(obj, indent=2)}], "isError": False}
+
+
+def _err(msg: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    args = arguments or {}
+    try:
+        if name == "pulsare_status":
+            return _ok(status())
+        if name == "pulsare_yield":
+            return _ok(pulsare_yield(str(args.get("kind") or ""), list(args.get("files") or [])))
+        if name == "pulsare_knock":
+            return _ok(pulsare_knock())
+        if name == "pulsare_ask_admin":
+            return _ok(
+                pulsare_yield(
+                    "ask-admin",
+                    list(args.get("files") or []),
+                    note=str(args.get("note") or ""),
+                )
+            )
+        if name == "pulsare_halt":
+            return _ok(pulsare_yield("halt", list(args.get("files") or [])))
+        return _err(f"unknown tool {name}")
+    except Error as exc:
+        return _err(str(exc))
+
+
+def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "protocolVersion": PROTOCOL,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "pulsare", "version": "2"},
+                "instructions": (
+                    "Knock the counterpart with pulsare_yield when files are on disk. "
+                    "No floor, no sequence. If they missed it, pulsare_knock. "
+                    "Do not use Task/spawn_subagent for the counterpart."
+                ),
+            },
+        }
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": mid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools()}}
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": call_tool(str(params.get("name") or ""), params.get("arguments")),
+        }
+    if mid is None:
+        return None
+    return {
+        "jsonrpc": "2.0",
+        "id": mid,
+        "error": {"code": -32601, "message": f"method not found: {method}"},
+    }
+
+
+def _write(stdout, msg: dict[str, Any], *, headers: bool) -> None:
+    raw = json.dumps(msg, ensure_ascii=False)
+    if headers:
+        stdout.write(f"Content-Length: {len(raw.encode())}\r\n\r\n{raw}")
+    else:
+        stdout.write(raw + "\n")
+    stdout.flush()
+
+
+def serve() -> int:
+    stdin, stdout = sys.stdin, sys.stdout
+    headers = False
+    while True:
+        try:
+            peek = stdin.readline()
+        except KeyboardInterrupt:
+            return 0
+        if peek == "":
+            return 0
+        if peek.lower().startswith("content-length:"):
+            headers = True
+            n = int(peek.split(":", 1)[1])
+            while True:
+                line = stdin.readline()
+                if line in ("\r\n", "\n", ""):
+                    break
+            msg = json.loads(stdin.read(n))
+        else:
+            text = peek.strip()
+            if not text:
+                continue
+            msg = json.loads(text)
+        reply = handle(msg)
+        if reply is not None:
+            _write(stdout, reply, headers=headers)
+    return 0
+
+
+def install(cwd: Path, sess: str, binary: Path) -> None:
+    root = cwd / ".pulsare"
+    if not root.is_dir():
+        init(cwd, sess)
+        print(f"init {root} session={sess}")
+    else:
+        data = session(root)
+        data["session"] = sess
+        write_json(root / "session.json", data)
+        print(f"mailbox {root} session={sess}")
+    try:
+        bind(root, sess)
+        print(f"layout  {sess}:claude + {sess}:grok")
+    except Error as exc:
+        print(f"layout  pending ({exc})")
+
+    grok_cfg = Path.home() / ".grok" / "config.toml"
+    grok_cfg.parent.mkdir(parents=True, exist_ok=True)
+    block = (
+        "\n[mcp_servers.pulsare]\n"
+        f'command = "{binary}"\n'
+        'args = ["mcp"]\n'
+        f'env = {{ PULSARE_ROLE = "grok", PULSARE_SESSION = "{sess}" }}\n'
+        "enabled = true\n"
+    )
+    text = grok_cfg.read_text(encoding="utf-8") if grok_cfg.is_file() else ""
+    if "[mcp_servers.pulsare]" not in text:
+        grok_cfg.write_text(text.rstrip() + "\n" + block, encoding="utf-8")
+        print(f"mcp     grok  PULSARE_ROLE=grok session={sess}")
+    else:
+        print(f"mcp     grok  already present in {grok_cfg}")
+
+    claude_cfg = Path.home() / ".claude.json"
+    if claude_cfg.is_file():
+        data = json.loads(claude_cfg.read_text(encoding="utf-8"))
+    else:
+        data = {}
+    servers = data.setdefault("mcpServers", {})
+    servers["pulsare"] = {
+        "type": "stdio",
+        "command": str(binary),
+        "args": ["mcp"],
+        "env": {"PULSARE_ROLE": "claude", "PULSARE_SESSION": sess},
+    }
+    claude_cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"mcp     claude PULSARE_ROLE=claude session={sess}")
+
+    for dest in (Path.home() / ".grok" / "skills" / "pulsare", Path.home() / ".claude" / "skills" / "pulsare"):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "SKILL.md").write_text(SKILL, encoding="utf-8")
+        print(f"skill   {dest / 'SKILL.md'}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("mcp", "--mcp"):
+        return serve()
+    p = argparse.ArgumentParser(prog="pulsare")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init")
+    i.add_argument("--cwd", default=".")
+    i.add_argument("--session", required=True)
+    sub.add_parser("status")
+    y = sub.add_parser("yield")
+    y.add_argument("--kind", required=True)
+    y.add_argument("--files", nargs="*")
+    sub.add_parser("knock", help="re-send the current inbox")
+    ins = sub.add_parser("install")
+    ins.add_argument("--cwd", default=".")
+    ins.add_argument("--session", required=True)
+    args = p.parse_args(argv)
+    try:
+        if args.cmd == "init":
+            print(init(Path(args.cwd).resolve(), args.session))
+            return 0
+        if args.cmd == "status":
+            print(json.dumps(status(), indent=2))
+            return 0
+        if args.cmd == "yield":
+            print(json.dumps(pulsare_yield(args.kind, args.files or []), indent=2))
+            return 0
+        if args.cmd == "knock":
+            print(json.dumps(pulsare_knock(), indent=2))
+            return 0
+        if args.cmd == "install":
+            install(Path(args.cwd).resolve(), args.session, Path(__file__).resolve())
+            return 0
+    except Error as exc:
+        print(f"pulsare: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
