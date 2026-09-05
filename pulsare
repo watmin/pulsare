@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -242,11 +243,32 @@ def chrome_in_footer(visible: str) -> str | None:
     return None
 
 
+def pane_text(target: str) -> str:
+    return tmux("capture-pane", "-p", "-t", target).stdout or ""
+
+
 def pane_busy(target: str) -> str | None:
     if pane_in_mode(target):
         return "copy-mode"
-    vis = tmux("capture-pane", "-p", "-t", target).stdout or ""
-    return chrome_in_footer(vis)
+    return chrome_in_footer(pane_text(target))
+
+
+def pointer_line(line: str) -> str:
+    return (line.splitlines() or [""])[0].rstrip("\r\n")
+
+
+def composer_holds(visible: str, line: str) -> bool:
+    """True when the pointer is sitting in the prompt, not yet a turn."""
+    needle = pointer_line(line)
+    if len(needle) < 12:
+        return False
+    tail = "\n".join(visible.splitlines()[-12:])
+    return needle[:64].lower() in tail.lower()
+
+
+def footer_has(visible: str, needle: str) -> bool:
+    tail = "\n".join(visible.splitlines()[-8:]).lower()
+    return needle.lower() in tail
 
 
 def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
@@ -267,23 +289,57 @@ def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _enter(target: str) -> None:
+    enter = tmux("send-keys", "-t", target, "Enter")
+    if enter.returncode != 0:
+        raise Error(enter.stderr.strip() or "tmux Enter failed")
+
+
+def _wait_composer(target: str, line: str, ticks: int = 20) -> str:
+    vis = pane_text(target)
+    for _ in range(ticks):
+        if pane_busy(target) or composer_holds(vis, line):
+            return vis
+        time.sleep(0.03)
+        vis = pane_text(target)
+    return vis
+
+
 def knock(target: str, line: str) -> None:
+    """Type the pointer if needed, then Enter. Never Tab (Grok: Tab leaves the prompt).
+
+    Grok paints the draft one tick after the pty bytes. Enter before that paint
+    is a no-op, which is how a line sits in the composer with Enter:send and
+    never submits. If the pointer is already in the prompt, only Enter.
+    """
+    line = pointer_line(line)
     if pane_in_mode(target):
         raise Error(f"{target} is in copy-mode; refuse send-keys")
     busy = pane_busy(target)
     if busy:
         raise Error(f"{target} looks in-turn ({busy})")
+    if not line:
+        raise Error("empty ingest line")
     if len(line) > 16000:
         raise Error("ingest line exceeds tmux send-keys cap")
-    send = tmux("send-keys", "-t", target, "-l", "--", line)
-    if send.returncode != 0:
-        raise Error(send.stderr.strip() or "tmux send-keys failed")
-    vis = (tmux("capture-pane", "-p", "-t", target).stdout or "").lower()
-    if "accept suggestion" in vis:
+    vis = pane_text(target)
+    if not composer_holds(vis, line):
+        send = tmux("send-keys", "-t", target, "-l", "--", line)
+        if send.returncode != 0:
+            raise Error(send.stderr.strip() or "tmux send-keys failed")
+        vis = _wait_composer(target, line)
+        if pane_busy(target):
+            return
+    if footer_has(vis, "accept suggestion"):
+        # Claude ghost-complete. Footer only — Tab on Grok focuses scrollback.
         tmux("send-keys", "-t", target, "Tab")
-    enter = tmux("send-keys", "-t", target, "Enter")
-    if enter.returncode != 0:
-        raise Error(enter.stderr.strip() or "tmux Enter failed")
+        vis = pane_text(target)
+    _enter(target)
+    vis = _wait_composer(target, line, ticks=8)
+    if pane_busy(target):
+        return
+    if composer_holds(vis, line):
+        _enter(target)
 
 
 def write_inbox(root: Path, role: str, kind: str, files: list[str]) -> tuple[Path, str, list[str]]:
