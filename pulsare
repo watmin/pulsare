@@ -258,12 +258,18 @@ def pointer_line(line: str) -> str:
 
 
 def composer_holds(visible: str, line: str) -> bool:
-    """True when the pointer is sitting in the prompt, not yet a turn."""
-    needle = pointer_line(line)
+    """True only when the pointer is on the live ❯ composer line.
+
+    A recap or JSON dump of a prior yield in the transcript is not a draft.
+    Matching those made knock skip typing and hit Enter on an empty prompt.
+    """
+    needle = pointer_line(line)[:64].lower()
     if len(needle) < 12:
         return False
-    tail = "\n".join(visible.splitlines()[-12:])
-    return needle[:64].lower() in tail.lower()
+    for row in visible.splitlines()[-8:]:
+        if "❯" in row and needle in row.lower():
+            return True
+    return False
 
 
 def footer_has(visible: str, needle: str) -> bool:
@@ -315,12 +321,18 @@ def _wait_gone(target: str, line: str, ticks: int = 8) -> str:
     return vis
 
 
+def _type_pointer(target: str, line: str) -> None:
+    send = tmux("send-keys", "-t", target, "-l", "--", line)
+    if send.returncode != 0:
+        raise Error(send.stderr.strip() or "tmux send-keys failed")
+
+
 def knock(target: str, line: str) -> None:
     """Type the pointer if needed, then Enter. Mid-turn is fine (Grok queues).
 
     Copy-mode is the only refuse: keys would go into the buffer, not the prompt.
-    In-turn chrome is not a lock. If the pointer is already in the composer,
-    only Enter.
+    Success means the pointer showed on the ❯ line, then left or a second Enter
+    was sent. If it never appears, fail — do not report a knock that did not land.
     """
     line = pointer_line(line)
     if pane_in_mode(target):
@@ -331,10 +343,13 @@ def knock(target: str, line: str) -> None:
         raise Error("ingest line exceeds tmux send-keys cap")
     vis = pane_text(target)
     if not composer_holds(vis, line):
-        send = tmux("send-keys", "-t", target, "-l", "--", line)
-        if send.returncode != 0:
-            raise Error(send.stderr.strip() or "tmux send-keys failed")
+        _type_pointer(target, line)
         vis = _wait_composer(target, line)
+    if not composer_holds(vis, line):
+        _type_pointer(target, line)
+        vis = _wait_composer(target, line, ticks=40)
+    if not composer_holds(vis, line):
+        raise Error(f"{target} did not take the pointer (composer never showed it)")
     if footer_has(vis, "accept suggestion"):
         # Claude ghost-complete. Footer only — Tab on Grok focuses scrollback.
         tmux("send-keys", "-t", target, "Tab")

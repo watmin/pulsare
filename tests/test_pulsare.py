@@ -58,15 +58,20 @@ class InboxTest(unittest.TestCase):
             "PULSARE INGEST kind=briefed file=/tmp/to-grok",
         )
 
-    def test_composer_holds_is_tail_only(self) -> None:
-        line = "PULSARE INGEST kind=briefed file=/home/john/work/holon/.pulsare/to-grok"
-        history = (
-            "old " + line + "\n"
-            + ("work line\n" * 20)
-            + "Enter:send  │  Shift+Tab:mode\n"
+    def test_composer_holds_is_the_prompt_line(self) -> None:
+        line = "PULSARE INGEST kind=scored file=/home/john/work/holon/.pulsare/to-claude"
+        recap = (
+            "  \"ingest\": \"" + line + "\\nread:\\n\"\n"
+            "❯ \n"
+            "── footer ──\n"
+            "auto mode on\n"
         )
-        self.assertFalse(pulsare.composer_holds(history, line))
-        live = history + "❯ " + line + "\n"
+        self.assertFalse(pulsare.composer_holds(recap, line))
+        live = (
+            "work line\n"
+            "│ ❯ " + line + "\n"
+            "Enter:send\n"
+        )
         self.assertTrue(pulsare.composer_holds(live, line))
 
     def test_accept_suggestion_is_footer_only(self) -> None:
