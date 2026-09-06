@@ -58,41 +58,6 @@ class InboxTest(unittest.TestCase):
             "PULSARE INGEST kind=briefed file=/tmp/to-grok",
         )
 
-    def test_composer_holds_is_the_prompt_line(self) -> None:
-        line = "PULSARE INGEST kind=scored file=/home/john/work/holon/.pulsare/to-claude"
-        recap = (
-            "  \"ingest\": \"" + line + "\\nread:\\n\"\n"
-            "❯ \n"
-            "── footer ──\n"
-            "auto mode on\n"
-        )
-        self.assertFalse(pulsare.composer_holds(recap, line))
-        live = (
-            "work line\n"
-            "│ ❯ " + line + "\n"
-            "Enter:send\n"
-        )
-        self.assertTrue(pulsare.composer_holds(live, line))
-
-    def test_accept_suggestion_is_footer_only(self) -> None:
-        history = "accept suggestion\n" + ("work\n" * 20) + "Enter:send\n"
-        self.assertFalse(pulsare.footer_has(history, "accept suggestion"))
-        live = ("work\n" * 20) + "Tab: accept suggestion\n"
-        self.assertTrue(pulsare.footer_has(live, "accept suggestion"))
-
-    def test_busy_chrome_is_footer_only(self) -> None:
-        history = (
-            "esc to interrupt\n"
-            + ("work line\n" * 20)
-            + "Churned for 9s · done 11:32 PM\n"
-            "❯ \n"
-            "── footer ──\n"
-            "auto mode on (shift+tab to cycle)\n"
-        )
-        self.assertIsNone(pulsare.chrome_in_footer(history))
-        live = history.replace("auto mode on (shift+tab to cycle)", "esc to interrupt")
-        self.assertEqual(pulsare.chrome_in_footer(live), "esc to interrupt")
-
     def test_knock_without_inbox_errors(self) -> None:
         with self.assertRaises(pulsare.Error) as ctx:
             pulsare.pulsare_knock()

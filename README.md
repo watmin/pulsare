@@ -43,8 +43,8 @@ windows are ignored.
 | `pulsare_ask_admin` | note for the builder. No knock. |
 | `pulsare_halt` | tell the peer you are done (still a knock). |
 
-Mid-turn is not a lock. Yield knocks anyway (Grok queues the follow-up).
-If they missed it, `pulsare_knock`. Do not invent a new yield to retry.
+Yield always `send-keys` the pointer then Enter. If the TUI queues it, it
+queues. A missed knock is `pulsare_knock`, not a new yield.
 
 ## CLI
 

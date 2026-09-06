@@ -22,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,16 +30,6 @@ ROLES = ("claude", "grok")
 KINDS = ("drawn", "briefed", "scored", "struck", "refute", "ask-admin", "halt")
 REQUIRED_WINDOWS = ("claude", "grok")
 PROTOCOL = "2024-11-05"
-BUSY = (
-    "esc to interrupt",
-    "esc to stop",
-    "ctrl+c to stop",
-    "esc:cancel",
-    "thinking…",
-    "thinking...",
-    "[stop]",
-    "photosynthesizing",
-)
 SKILL = """---
 name: pulsare
 description: >
@@ -54,7 +43,7 @@ Latin: to knock. Write the files, then knock. There is no floor and no sequence.
 
 - `pulsare_yield` kind=briefed files=[…] — write `.pulsare/to-grok` and send-keys into `grok`
 - `pulsare_yield` kind=scored files=[…] — write `.pulsare/to-claude` and send-keys into `claude`
-- `pulsare_knock` — send-keys the current inbox again. Always legal, even if the peer looks in-turn.
+- `pulsare_knock` — send-keys the current inbox again. Always a tmux write.
 - `pulsare_ask_admin` — note for the builder, no knock
 - `pulsare_halt` — tell the peer you are done (still a knock; they read the file)
 
@@ -235,46 +224,8 @@ def pane_in_mode(target: str) -> bool:
     return proc.stdout.strip() == "1"
 
 
-def chrome_in_footer(visible: str) -> str | None:
-    tail = "\n".join(visible.splitlines()[-8:]).lower()
-    for needle in BUSY:
-        if needle in tail:
-            return needle
-    return None
-
-
-def pane_text(target: str) -> str:
-    return tmux("capture-pane", "-p", "-t", target).stdout or ""
-
-
-def pane_busy(target: str) -> str | None:
-    if pane_in_mode(target):
-        return "copy-mode"
-    return chrome_in_footer(pane_text(target))
-
-
 def pointer_line(line: str) -> str:
     return (line.splitlines() or [""])[0].rstrip("\r\n")
-
-
-def composer_holds(visible: str, line: str) -> bool:
-    """True only when the pointer is on the live ❯ composer line.
-
-    A recap or JSON dump of a prior yield in the transcript is not a draft.
-    Matching those made knock skip typing and hit Enter on an empty prompt.
-    """
-    needle = pointer_line(line)[:64].lower()
-    if len(needle) < 12:
-        return False
-    for row in visible.splitlines()[-8:]:
-        if "❯" in row and needle in row.lower():
-            return True
-    return False
-
-
-def footer_has(visible: str, needle: str) -> bool:
-    tail = "\n".join(visible.splitlines()[-8:]).lower()
-    return needle.lower() in tail
 
 
 def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
@@ -295,69 +246,26 @@ def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _enter(target: str) -> None:
-    enter = tmux("send-keys", "-t", target, "Enter")
-    if enter.returncode != 0:
-        raise Error(enter.stderr.strip() or "tmux Enter failed")
-
-
-def _wait_composer(target: str, line: str, ticks: int = 20) -> str:
-    vis = pane_text(target)
-    for _ in range(ticks):
-        if composer_holds(vis, line):
-            return vis
-        time.sleep(0.03)
-        vis = pane_text(target)
-    return vis
-
-
-def _wait_gone(target: str, line: str, ticks: int = 8) -> str:
-    vis = pane_text(target)
-    for _ in range(ticks):
-        if not composer_holds(vis, line):
-            return vis
-        time.sleep(0.03)
-        vis = pane_text(target)
-    return vis
-
-
-def _type_pointer(target: str, line: str) -> None:
-    send = tmux("send-keys", "-t", target, "-l", "--", line)
-    if send.returncode != 0:
-        raise Error(send.stderr.strip() or "tmux send-keys failed")
-
-
 def knock(target: str, line: str) -> None:
-    """Type the pointer if needed, then Enter. Mid-turn is fine (Grok queues).
+    """Write the pointer into the pane. No capture, no busy check, no skip.
 
-    Copy-mode is the only refuse: keys would go into the buffer, not the prompt.
-    Success means the pointer showed on the ❯ line, then left or a second Enter
-    was sent. If it never appears, fail — do not report a knock that did not land.
+    Copy-mode is the only refuse: keys would miss the prompt. Anything else
+    (in-turn, overlay, queue) is the TUI's problem. Success means tmux
+    accepted both send-keys.
     """
     line = pointer_line(line)
-    if pane_in_mode(target):
-        raise Error(f"{target} is in copy-mode; refuse send-keys")
     if not line:
         raise Error("empty ingest line")
     if len(line) > 16000:
         raise Error("ingest line exceeds tmux send-keys cap")
-    vis = pane_text(target)
-    if not composer_holds(vis, line):
-        _type_pointer(target, line)
-        vis = _wait_composer(target, line)
-    if not composer_holds(vis, line):
-        _type_pointer(target, line)
-        vis = _wait_composer(target, line, ticks=40)
-    if not composer_holds(vis, line):
-        raise Error(f"{target} did not take the pointer (composer never showed it)")
-    if footer_has(vis, "accept suggestion"):
-        # Claude ghost-complete. Footer only — Tab on Grok focuses scrollback.
-        tmux("send-keys", "-t", target, "Tab")
-        vis = pane_text(target)
-    _enter(target)
-    vis = _wait_gone(target, line)
-    if composer_holds(vis, line):
-        _enter(target)
+    if pane_in_mode(target):
+        raise Error(f"{target} is in copy-mode; refuse send-keys")
+    send = tmux("send-keys", "-t", target, "-l", "--", line)
+    if send.returncode != 0:
+        raise Error(send.stderr.strip() or "tmux send-keys failed")
+    enter = tmux("send-keys", "-t", target, "Enter")
+    if enter.returncode != 0:
+        raise Error(enter.stderr.strip() or "tmux Enter failed")
 
 
 def write_inbox(root: Path, role: str, kind: str, files: list[str]) -> tuple[Path, str, list[str]]:
@@ -418,11 +326,8 @@ def pulsare_yield(kind: str, files: list[str] | None = None, *, note: str = "") 
     else:
         target = session(root)["tmux"][peer]
         line = f"PULSARE INGEST kind={kind} file={box}"
-        try:
-            knock(target, line)
-            knock_note = target
-        except Error as exc:
-            knock_note = f"pending ({exc})"
+        knock(target, line)
+        knock_note = target
     return {
         "role": role,
         "peer": peer,
@@ -449,17 +354,13 @@ def pulsare_knock() -> dict[str, Any]:
     kind = str(rec.get("kind") or "briefed")
     target = session(root)["tmux"][peer]
     line = f"PULSARE INGEST kind={kind} file={box}"
-    try:
-        knock(target, line)
-        knocked = target
-    except Error as exc:
-        knocked = f"pending ({exc})"
+    knock(target, line)
     return {
         "role": role,
         "peer": peer,
         "kind": kind,
         "inbox": str(box),
-        "knock": knocked,
+        "knock": target,
         "ingest": box.read_text(encoding="utf-8"),
     }
 
@@ -482,8 +383,8 @@ def tools() -> list[dict[str, Any]]:
         {
             "name": "pulsare_yield",
             "description": (
-                f"Write .pulsare/to-{peer} and send-keys into window '{peer}'. "
-                "No floor, no sequence, no in-turn lock. If you have files, knock."
+                f"Write .pulsare/to-{peer} and tmux send-keys into window '{peer}'. "
+                "Always writes keys. Queueing is the TUI's problem."
             ),
             "inputSchema": {
                 "type": "object",
@@ -501,8 +402,7 @@ def tools() -> list[dict[str, Any]]:
         {
             "name": "pulsare_knock",
             "description": (
-                f"Send-keys the current .pulsare/to-{peer} again. Always legal, "
-                "including while the peer is mid-turn. Use when they missed the first knock."
+                f"tmux send-keys the current .pulsare/to-{peer} again. Always a write."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
@@ -574,9 +474,8 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "pulsare", "version": "2"},
                 "instructions": (
-                    "Knock the counterpart with pulsare_yield when files are on disk. "
-                    "No floor, no sequence, no waiting for them to go idle. "
-                    "If they missed it, pulsare_knock. "
+                    "Knock with pulsare_yield when files are on disk. "
+                    "That is a tmux send-keys, always. If they missed it, pulsare_knock. "
                     "Do not use Task/spawn_subagent for the counterpart."
                 ),
             },
