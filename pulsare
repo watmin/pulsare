@@ -54,7 +54,7 @@ Latin: to knock. Write the files, then knock. There is no floor and no sequence.
 
 - `pulsare_yield` kind=briefed files=[…] — write `.pulsare/to-grok` and send-keys into `grok`
 - `pulsare_yield` kind=scored files=[…] — write `.pulsare/to-claude` and send-keys into `claude`
-- `pulsare_knock` — send-keys the current inbox again. Always legal. Use when the peer missed it.
+- `pulsare_knock` — send-keys the current inbox again. Always legal, even if the peer looks in-turn.
 - `pulsare_ask_admin` — note for the builder, no knock
 - `pulsare_halt` — tell the peer you are done (still a knock; they read the file)
 
@@ -298,7 +298,17 @@ def _enter(target: str) -> None:
 def _wait_composer(target: str, line: str, ticks: int = 20) -> str:
     vis = pane_text(target)
     for _ in range(ticks):
-        if pane_busy(target) or composer_holds(vis, line):
+        if composer_holds(vis, line):
+            return vis
+        time.sleep(0.03)
+        vis = pane_text(target)
+    return vis
+
+
+def _wait_gone(target: str, line: str, ticks: int = 8) -> str:
+    vis = pane_text(target)
+    for _ in range(ticks):
+        if not composer_holds(vis, line):
             return vis
         time.sleep(0.03)
         vis = pane_text(target)
@@ -306,18 +316,15 @@ def _wait_composer(target: str, line: str, ticks: int = 20) -> str:
 
 
 def knock(target: str, line: str) -> None:
-    """Type the pointer if needed, then Enter. Never Tab (Grok: Tab leaves the prompt).
+    """Type the pointer if needed, then Enter. Mid-turn is fine (Grok queues).
 
-    Grok paints the draft one tick after the pty bytes. Enter before that paint
-    is a no-op, which is how a line sits in the composer with Enter:send and
-    never submits. If the pointer is already in the prompt, only Enter.
+    Copy-mode is the only refuse: keys would go into the buffer, not the prompt.
+    In-turn chrome is not a lock. If the pointer is already in the composer,
+    only Enter.
     """
     line = pointer_line(line)
     if pane_in_mode(target):
         raise Error(f"{target} is in copy-mode; refuse send-keys")
-    busy = pane_busy(target)
-    if busy:
-        raise Error(f"{target} looks in-turn ({busy})")
     if not line:
         raise Error("empty ingest line")
     if len(line) > 16000:
@@ -328,16 +335,12 @@ def knock(target: str, line: str) -> None:
         if send.returncode != 0:
             raise Error(send.stderr.strip() or "tmux send-keys failed")
         vis = _wait_composer(target, line)
-        if pane_busy(target):
-            return
     if footer_has(vis, "accept suggestion"):
         # Claude ghost-complete. Footer only — Tab on Grok focuses scrollback.
         tmux("send-keys", "-t", target, "Tab")
         vis = pane_text(target)
     _enter(target)
-    vis = _wait_composer(target, line, ticks=8)
-    if pane_busy(target):
-        return
+    vis = _wait_gone(target, line)
     if composer_holds(vis, line):
         _enter(target)
 
@@ -465,7 +468,7 @@ def tools() -> list[dict[str, Any]]:
             "name": "pulsare_yield",
             "description": (
                 f"Write .pulsare/to-{peer} and send-keys into window '{peer}'. "
-                "No floor, no sequence. If you have files, knock."
+                "No floor, no sequence, no in-turn lock. If you have files, knock."
             ),
             "inputSchema": {
                 "type": "object",
@@ -483,8 +486,8 @@ def tools() -> list[dict[str, Any]]:
         {
             "name": "pulsare_knock",
             "description": (
-                f"Send-keys the current .pulsare/to-{peer} again. Always legal. "
-                "Use when yield said pending, or the peer never woke."
+                f"Send-keys the current .pulsare/to-{peer} again. Always legal, "
+                "including while the peer is mid-turn. Use when they missed the first knock."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
@@ -557,7 +560,8 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
                 "serverInfo": {"name": "pulsare", "version": "2"},
                 "instructions": (
                     "Knock the counterpart with pulsare_yield when files are on disk. "
-                    "No floor, no sequence. If they missed it, pulsare_knock. "
+                    "No floor, no sequence, no waiting for them to go idle. "
+                    "If they missed it, pulsare_knock. "
                     "Do not use Task/spawn_subagent for the counterpart."
                 ),
             },

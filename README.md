@@ -43,9 +43,8 @@ windows are ignored.
 | `pulsare_ask_admin` | note for the builder. No knock. |
 | `pulsare_halt` | tell the peer you are done (still a knock). |
 
-If yield returns `knock: pending (… looks in-turn …)`, the inbox is already
-written. Call `pulsare_knock` when the peer is idle. Do not invent a new yield
-to retry.
+Mid-turn is not a lock. Yield knocks anyway (Grok queues the follow-up).
+If they missed it, `pulsare_knock`. Do not invent a new yield to retry.
 
 ## CLI
 
