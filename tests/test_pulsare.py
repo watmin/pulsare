@@ -58,10 +58,11 @@ class InboxTest(unittest.TestCase):
             "PULSARE INGEST kind=briefed file=/tmp/to-grok",
         )
 
-    def test_knock_without_inbox_errors(self) -> None:
-        with self.assertRaises(pulsare.Error) as ctx:
-            pulsare.pulsare_knock()
-        self.assertIn("no inbox", str(ctx.exception))
+    def test_only_yield_tool(self) -> None:
+        names = [t["name"] for t in pulsare.tools()]
+        self.assertEqual(names, ["pulsare_yield"])
+        kinds = pulsare.tools()[0]["inputSchema"]["properties"]["kind"]["enum"]
+        self.assertEqual(kinds, list(pulsare.KINDS))
 
 
 if __name__ == "__main__":

@@ -43,12 +43,11 @@ Latin: to knock. Write the files, then knock. There is no floor and no sequence.
 
 - `pulsare_yield` kind=briefed files=[…] — write `.pulsare/to-grok` and send-keys into `grok`
 - `pulsare_yield` kind=scored files=[…] — write `.pulsare/to-claude` and send-keys into `claude`
-- `pulsare_knock` — send-keys the current inbox again. Always a tmux write.
-- `pulsare_ask_admin` — note for the builder, no knock
-- `pulsare_halt` — tell the peer you are done (still a knock; they read the file)
+- `pulsare_yield` kind=halt | refute | struck | ask-admin the same way
 
 The ingest line is a pointer: `PULSARE INGEST kind=… file=.pulsare/to-<peer>`.
 Read that file, then the listed arc files. Do not paste the brief.
+If they missed it, yield again. There is no separate knock tool.
 """
 
 
@@ -238,7 +237,7 @@ def ingest_text(role: str, kind: str, files: list[str], box: Path) -> str:
     if kind in ("drawn", "briefed"):
         lines.append("Those files are the stone. Strike. Write SCORE. Then pulsare_yield kind=scored.")
     elif kind == "scored":
-        lines.append("Those files are the strike. Independent re-run. Then pulsare_yield or pulsare_halt.")
+        lines.append("Those files are the strike. Independent re-run. Then pulsare_yield.")
     elif kind == "halt":
         lines.append("Peer halted. Done-when is claimed. Read the files.")
     else:
@@ -310,7 +309,7 @@ def status() -> dict[str, Any]:
     return out
 
 
-def pulsare_yield(kind: str, files: list[str] | None = None, *, note: str = "") -> dict[str, Any]:
+def pulsare_yield(kind: str, files: list[str] | None = None) -> dict[str, Any]:
     if kind not in KINDS:
         raise Error(f"unknown kind {kind!r}")
     role = role_of()
@@ -319,39 +318,6 @@ def pulsare_yield(kind: str, files: list[str] | None = None, *, note: str = "") 
     bind(root, name)
     peer = other(role)
     box, text, rels = write_inbox(root, role, kind, list(files or []))
-    knock_note = "none"
-    if kind == "ask-admin":
-        knock_note = "ask-admin (no knock)"
-        tmux("display-message", "-t", name, f"PULSARE ask-admin from={role} {note}".strip())
-    else:
-        target = session(root)["tmux"][peer]
-        line = f"PULSARE INGEST kind={kind} file={box}"
-        knock(target, line)
-        knock_note = target
-    return {
-        "role": role,
-        "peer": peer,
-        "kind": kind,
-        "files": rels,
-        "inbox": str(box),
-        "knock": knock_note,
-        "note": note,
-        "ingest": text,
-    }
-
-
-def pulsare_knock() -> dict[str, Any]:
-    """Always legal. Re-send the current inbox at the peer."""
-    role = role_of()
-    root = find_root()
-    peer = other(role)
-    box = inbox(root, peer)
-    if not box.is_file():
-        raise Error(f"no inbox yet ({box.name}) — pulsare_yield first")
-    name = session_name(root)
-    bind(root, name)
-    rec = last(root)
-    kind = str(rec.get("kind") or "briefed")
     target = session(root)["tmux"][peer]
     line = f"PULSARE INGEST kind={kind} file={box}"
     knock(target, line)
@@ -359,9 +325,10 @@ def pulsare_knock() -> dict[str, Any]:
         "role": role,
         "peer": peer,
         "kind": kind,
+        "files": rels,
         "inbox": str(box),
         "knock": target,
-        "ingest": box.read_text(encoding="utf-8"),
+        "ingest": text,
     }
 
 
@@ -373,57 +340,19 @@ def tools() -> list[dict[str, Any]]:
         role, peer = "unset", "counterpart"
     return [
         {
-            "name": "pulsare_status",
-            "description": (
-                f"You are {role}. Peer is {peer} in tmux window '{peer}'. "
-                "Shows last inbox contents. Does not send keys."
-            ),
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-        {
             "name": "pulsare_yield",
             "description": (
                 f"Write .pulsare/to-{peer} and tmux send-keys into window '{peer}'. "
-                "Always writes keys. Queueing is the TUI's problem."
+                "Always writes keys. Queueing is the TUI's problem. "
+                "Missed it: yield again. Halt, refute, ask-admin are kinds, not tools."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["drawn", "briefed", "scored", "struck", "refute"],
-                    },
+                    "kind": {"type": "string", "enum": list(KINDS)},
                     "files": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["kind", "files"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "pulsare_knock",
-            "description": (
-                f"tmux send-keys the current .pulsare/to-{peer} again. Always a write."
-            ),
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-        {
-            "name": "pulsare_ask_admin",
-            "description": "Need the builder. Writes the inbox, does not knock the peer.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "files": {"type": "array", "items": {"type": "string"}},
-                    "note": {"type": "string"},
-                },
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "pulsare_halt",
-            "description": "Tell the peer you are done. Still a knock; they read the inbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"files": {"type": "array", "items": {"type": "string"}}},
+                "required": ["kind"],
                 "additionalProperties": False,
             },
         },
@@ -441,22 +370,8 @@ def _err(msg: str) -> dict[str, Any]:
 def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     args = arguments or {}
     try:
-        if name == "pulsare_status":
-            return _ok(status())
         if name == "pulsare_yield":
             return _ok(pulsare_yield(str(args.get("kind") or ""), list(args.get("files") or [])))
-        if name == "pulsare_knock":
-            return _ok(pulsare_knock())
-        if name == "pulsare_ask_admin":
-            return _ok(
-                pulsare_yield(
-                    "ask-admin",
-                    list(args.get("files") or []),
-                    note=str(args.get("note") or ""),
-                )
-            )
-        if name == "pulsare_halt":
-            return _ok(pulsare_yield("halt", list(args.get("files") or [])))
         return _err(f"unknown tool {name}")
     except Error as exc:
         return _err(str(exc))
@@ -472,10 +387,10 @@ def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": PROTOCOL,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "pulsare", "version": "2"},
+                "serverInfo": {"name": "pulsare", "version": "3"},
                 "instructions": (
-                    "Knock with pulsare_yield when files are on disk. "
-                    "That is a tmux send-keys, always. If they missed it, pulsare_knock. "
+                    "The only tool is pulsare_yield. Write the files, then yield. "
+                    "That is a tmux send-keys, always. Missed it: yield again. "
                     "Do not use Task/spawn_subagent for the counterpart."
                 ),
             },
@@ -606,7 +521,6 @@ def main(argv: list[str] | None = None) -> int:
     y = sub.add_parser("yield")
     y.add_argument("--kind", required=True)
     y.add_argument("--files", nargs="*")
-    sub.add_parser("knock", help="re-send the current inbox")
     ins = sub.add_parser("install")
     ins.add_argument("--cwd", default=".")
     ins.add_argument("--session", required=True)
@@ -620,9 +534,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "yield":
             print(json.dumps(pulsare_yield(args.kind, args.files or []), indent=2))
-            return 0
-        if args.cmd == "knock":
-            print(json.dumps(pulsare_knock(), indent=2))
             return 0
         if args.cmd == "install":
             install(Path(args.cwd).resolve(), args.session, Path(__file__).resolve())

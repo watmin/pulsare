@@ -38,13 +38,10 @@ windows are ignored.
 | tool | what it does |
 |---|---|
 | `pulsare_yield` | write `.pulsare/to-<peer>` and send-keys `PULSARE INGEST kind=… file=…` |
-| `pulsare_knock` | send-keys that inbox again. Always legal. |
-| `pulsare_status` | last write + inbox text. No keys. |
-| `pulsare_ask_admin` | note for the builder. No knock. |
-| `pulsare_halt` | tell the peer you are done (still a knock). |
 
 Yield always `send-keys` the pointer then Enter. If the TUI queues it, it
-queues. A missed knock is `pulsare_knock`, not a new yield.
+queues. Halt, refute, and ask-admin are `kind` values, not extra tools.
+A missed knock is another yield.
 
 ## CLI
 
@@ -52,7 +49,6 @@ queues. A missed knock is `pulsare_knock`, not a new yield.
 ./pulsare mcp                 # stdio MCP (what the harnesses spawn)
 ./pulsare status
 ./pulsare yield --kind scored --files path/to/SCORE.md
-./pulsare knock
 ```
 
 Python 3 stdlib only. tmux on PATH.
